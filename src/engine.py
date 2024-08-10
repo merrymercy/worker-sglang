@@ -1,85 +1,44 @@
-import subprocess
-import time
-import requests
-import openai
 import asyncio
-import aiohttp
+import requests
+from engine import SGlangEngine, OpenAIRequest
+import runpod
 
-class SGlangEngine:
-    def __init__(self, model="meta-llama/Meta-Llama-3-8B-Instruct", host="0.0.0.0", port=30000):
-        self.model = model
-        self.host = host
-        self.port = port
-        self.base_url = f"http://{host}:{port}"
-        self.process = None
+# Initialize the engine
+engine = SGlangEngine()
+engine.start_server()
+engine.wait_for_server()
 
-    def start_server(self):
-        command = [
-            "python3", "-m", "sglang.launch_server",
-            "--model", self.model,
-            "--host", self.host,
-            "--port", str(self.port)
-        ]
-        self.process = subprocess.Popen(command, stdout=None, stderr=None)
-        print(f"Server started with PID: {self.process.pid}")
 
-    def wait_for_server(self, timeout=300, interval=5):
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{self.base_url}/v1/models")
-                if response.status_code == 200:
-                    print("Server is ready!")
-                    return True
-            except requests.RequestException:
-                pass
-            time.sleep(interval)
-        raise TimeoutError("Server failed to start within the timeout period.")
-
-    def shutdown(self):
-        if self.process:
-            self.process.terminate()
-            self.process.wait()
-            print("Server shut down.")
-
-class OpenAIRequest:
-    def __init__(self, base_url="http://0.0.0.0:30000/v1", api_key="EMPTY"):
-        self.client = openai.Client(base_url=base_url, api_key=api_key)
+async def async_handler(job):
+    """Handle the requests asynchronously."""
+    job_input = job["input"]
+    print(f"JOB_INPUT: {job_input}")
     
-    async def request_chat_completions(self, model="default", messages=None, max_tokens=100, stream=False):
-        if messages is None:
-            messages = [
-                {"role": "system", "content": "You are a helpful AI assistant"},
-                {"role": "user", "content": "List 3 countries and their capitals."},
-            ]
+    if job_input.get("openai_route"):
+        openai_route, openai_input = job_input.get("openai_route"), job_input.get("openai_input")
+
+        openai_url = f"{engine.base_url}" + openai_route
+        headers = {"Content-Type": "application/json"}
+
+        response = requests.post(openai_url, headers=headers, json=openai_input, stream=True)
         
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            stream=stream
-        )
-        
-        if stream:
-            async for chunk in response:
-                yield chunk.to_dict()
+        # Process the streamed response
+        for chunk in response.iter_lines():
+            if chunk:
+                decoded_chunk = chunk.decode('utf-8')
+                yield chunk
+    else:
+        generate_url = f"{engine.base_url}/generate"
+        headers = {"Content-Type": "application/json"}
+        # Directly pass `job_input` to `json`. Can we tell users the possible fields of `job_input`?
+        response = requests.post(generate_url, json=job_input, headers=headers)
+        if response.status_code == 200:
+            yield response.json()
         else:
-            yield response.to_dict()
-    
-    async def request_completions(self, model="default", prompt="The capital of France is", max_tokens=100, stream=False):
-        response = self.client.completions.create(
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            stream=stream
-        )
-        
-        if stream:
-            async for chunk in response:
-                yield chunk.to_dict()
-        else:
-            yield response.to_dict()
-    
-    async def get_models(self):
-        response = await self.client.models.list()
-        return response
+            yield {"error": f"Generate request failed with status code {response.status_code}", "details": response.text}
+
+runpod.serverless.start({"handler": async_handler, "return_aggregate_stream": True})
+
+# # Ensure the server is shut down when the serverless function is terminated
+# import atexit
+# atexit.register(engine.shutdown)
